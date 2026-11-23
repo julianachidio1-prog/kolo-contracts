@@ -702,7 +702,14 @@ impl KoloSavingsContract {
             .publish((symbol_short!("emg_wd"), member), amount);
     }
 
-    /// Pause the contract (Admin only). Blocks contribute, payout, add_member, reset_cycle.
+    /// Pause the contract (Admin only). While paused, contribute, payout,
+    /// add_member, remove_member and withdraw_savings are rejected, and
+    /// emergency_withdraw becomes available.
+    ///
+    /// Not idempotent: calling `pause` on an already-paused contract panics
+    /// with "Contract is paused for emergency". Pausing only flips the pause
+    /// flag; members, contributions, the payout queue and cycle counters are
+    /// left untouched.
     pub fn pause(env: Env) {
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -713,6 +720,10 @@ impl KoloSavingsContract {
     }
 
     /// Unpause the contract (Admin only).
+    ///
+    /// Idempotent: unpausing a contract that is not paused still requires
+    /// admin auth but leaves it active. Like `pause`, it only clears the pause
+    /// flag and never resets any other group state.
     pub fn unpause(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();

@@ -1627,3 +1627,299 @@ fn test_emergency_withdraw_twice_panics() {
     // Second call should panic — no contribution left this cycle.
     client.emergency_withdraw(&member);
 }
+
+// ---------------------------------------------------------------------------
+// Pause / unpause authorization and transition tests
+// ---------------------------------------------------------------------------
+//
+// Documented semantics (see `pause` / `unpause` in lib.rs):
+//   * Only the stored admin can flip the pause flag, and an admin signature
+//     for one of the two functions can't be reused for the other.
+//   * `pause` is not idempotent — pausing twice panics.
+//   * `unpause` is idempotent — unpausing an active contract is a no-op.
+//   * Neither transition touches any other group state.
+
+fn setup_pausable_group(
+    env: &Env,
+) -> (
+    Address,
+    KoloSavingsContractClient<'_>,
+    Address,
+    token::StellarAssetClient<'_>,
+) {
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, KoloSavingsContract);
+    let client = KoloSavingsContractClient::new(env, &contract_id);
+
+    let admin = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token = env.register_stellar_asset_contract(token_admin);
+    let token_client = token::StellarAssetClient::new(env, &token);
+
+    client.initialize(
+        &admin,
+        &token,
+        &String::from_str(env, "Test Group"),
+        &1000i128,
+        &GroupType::Rotational,
+        &None,
+        &false,
+        &None,
+    );
+
+    (contract_id, client, admin, token_client)
+}
+
+/// Replace any mocked auths with a single signature from `signer` covering
+/// a zero-argument call to `fn_name` on the savings contract.
+fn mock_admin_call_auth(env: &Env, signer: &Address, contract_id: &Address, fn_name: &str) {
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: signer,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: contract_id,
+            fn_name,
+            args: ().into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+fn read_is_paused(env: &Env, contract_id: &Address) -> bool {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::IsPaused)
+            .unwrap_or(false)
+    })
+}
+
+/// Everything (other than the pause flag) that a pause/unpause round trip
+/// must leave exactly as it found it.
+#[derive(Debug, PartialEq)]
+struct GroupStateSnapshot {
+    admin: Address,
+    token: Address,
+    contribution_amount: i128,
+    members: Vec<Address>,
+    member_states: Vec<MemberState>,
+    next_payout_index: Option<u32>,
+    current_cycle_id: Option<u32>,
+    cycle_member_count: Option<i128>,
+    balance: i128,
+}
+
+fn snapshot_group_state(
+    env: &Env,
+    contract_id: &Address,
+    client: &KoloSavingsContractClient<'_>,
+) -> GroupStateSnapshot {
+    let balance = client.get_balance();
+    env.as_contract(contract_id, || {
+        let storage = env.storage();
+        let members: Vec<Address> = storage.instance().get(&DataKey::Members).unwrap();
+        let mut member_states: Vec<MemberState> = Vec::new(env);
+        for member in members.iter() {
+            member_states.push_back(storage.persistent().get(&DataKey::Member(member)).unwrap());
+        }
+
+        GroupStateSnapshot {
+            admin: storage.instance().get(&DataKey::Admin).unwrap(),
+            token: storage.instance().get(&DataKey::Token).unwrap(),
+            contribution_amount: storage
+                .instance()
+                .get(&DataKey::ContributionAmount)
+                .unwrap(),
+            members,
+            member_states,
+            next_payout_index: storage.instance().get(&DataKey::NextPayoutIndex),
+            current_cycle_id: storage.instance().get(&DataKey::CurrentCycleId),
+            cycle_member_count: storage.instance().get(&DataKey::CycleMemberCount),
+            balance,
+        }
+    })
+}
+
+#[test]
+fn test_admin_can_pause_and_unpause_with_own_signature() {
+    let env = Env::default();
+    let (contract_id, client, admin, _token_client) = setup_pausable_group(&env);
+
+    mock_admin_call_auth(&env, &admin, &contract_id, "pause");
+    client.pause();
+    // The only authorization the host consumed was the admin's. Read this
+    // before touching storage: `env.auths()` only reflects the last call.
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, admin);
+    assert!(read_is_paused(&env, &contract_id));
+
+    mock_admin_call_auth(&env, &admin, &contract_id, "unpause");
+    client.unpause();
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, admin);
+    assert!(!read_is_paused(&env, &contract_id));
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_pause_without_any_auth_fails() {
+    let env = Env::default();
+    let (_contract_id, client, _admin, _token_client) = setup_pausable_group(&env);
+
+    env.set_auths(&[]);
+    client.pause();
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_non_admin_cannot_unpause() {
+    let env = Env::default();
+    let (contract_id, client, _admin, _token_client) = setup_pausable_group(&env);
+
+    client.pause();
+
+    let attacker = Address::generate(&env);
+    mock_admin_call_auth(&env, &attacker, &contract_id, "unpause");
+    client.unpause();
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_admin_pause_signature_cannot_be_used_to_unpause() {
+    let env = Env::default();
+    let (contract_id, client, admin, _token_client) = setup_pausable_group(&env);
+
+    client.pause();
+
+    // The admin signed off on `pause`, not `unpause` — the signature is bound
+    // to the function name and must not be accepted for the opposite action.
+    mock_admin_call_auth(&env, &admin, &contract_id, "pause");
+    client.unpause();
+}
+
+#[test]
+fn test_rejected_pause_leaves_contract_active() {
+    let env = Env::default();
+    let (contract_id, client, _admin, token_client) = setup_pausable_group(&env);
+
+    let member = Address::generate(&env);
+    client.add_member(&member);
+    token_client.mint(&member, &5000);
+
+    let attacker = Address::generate(&env);
+    mock_admin_call_auth(&env, &attacker, &contract_id, "pause");
+    assert!(client.try_pause().is_err());
+    assert!(!read_is_paused(&env, &contract_id));
+
+    // Normal operations keep working after the failed attempt.
+    env.mock_all_auths();
+    client.contribute(&member, &1000);
+    assert_eq!(client.get_contribution(&member), 1000);
+}
+
+#[test]
+fn test_rejected_unpause_leaves_contract_paused() {
+    let env = Env::default();
+    let (contract_id, client, admin, token_client) = setup_pausable_group(&env);
+
+    let member = Address::generate(&env);
+    client.add_member(&member);
+    token_client.mint(&member, &5000);
+    client.pause();
+
+    let attacker = Address::generate(&env);
+    mock_admin_call_auth(&env, &attacker, &contract_id, "unpause");
+    assert!(client.try_unpause().is_err());
+    assert!(read_is_paused(&env, &contract_id));
+
+    env.mock_all_auths();
+    assert!(client.try_contribute(&member, &1000).is_err());
+
+    // The real admin can still lift the pause afterwards.
+    mock_admin_call_auth(&env, &admin, &contract_id, "unpause");
+    client.unpause();
+    assert!(!read_is_paused(&env, &contract_id));
+}
+
+#[test]
+#[should_panic(expected = "Contract is paused for emergency")]
+fn test_pause_when_already_paused_panics() {
+    let env = Env::default();
+    let (_contract_id, client, _admin, _token_client) = setup_pausable_group(&env);
+
+    client.pause();
+    client.pause();
+}
+
+#[test]
+fn test_unpause_is_idempotent() {
+    let env = Env::default();
+    let (contract_id, client, _admin, token_client) = setup_pausable_group(&env);
+
+    let member = Address::generate(&env);
+    client.add_member(&member);
+    token_client.mint(&member, &5000);
+
+    // Never paused: unpausing is a harmless no-op.
+    client.unpause();
+    assert!(!read_is_paused(&env, &contract_id));
+
+    client.pause();
+    client.unpause();
+    client.unpause();
+    assert!(!read_is_paused(&env, &contract_id));
+
+    client.contribute(&member, &1000);
+    assert_eq!(client.get_contribution(&member), 1000);
+}
+
+#[test]
+fn test_repeated_pause_unpause_preserves_group_state() {
+    let env = Env::default();
+    let (contract_id, client, _admin, token_client) = setup_pausable_group(&env);
+
+    let member0 = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+    client.add_member(&member0);
+    client.add_member(&member1);
+    client.add_member(&member2);
+    token_client.mint(&member0, &10000);
+    token_client.mint(&member1, &10000);
+    token_client.mint(&member2, &10000);
+
+    // Put the group mid-rotation so every counter holds a non-default value:
+    // one payout done, a fresh cycle started, and a partial contribution in.
+    client.contribute(&member0, &1000);
+    client.contribute(&member1, &1000);
+    client.contribute(&member2, &1000);
+    client.payout(&member0, &None);
+    client.reset_cycle();
+    client.contribute(&member1, &1000);
+
+    let before = snapshot_group_state(&env, &contract_id, &client);
+    assert_eq!(before.next_payout_index, Some(1));
+    assert_eq!(before.current_cycle_id, Some(2));
+    assert_eq!(before.cycle_member_count, Some(3));
+    assert_eq!(before.balance, 1000);
+
+    for _ in 0..3 {
+        client.pause();
+        assert!(read_is_paused(&env, &contract_id));
+        assert_eq!(snapshot_group_state(&env, &contract_id, &client), before);
+
+        client.unpause();
+        assert!(!read_is_paused(&env, &contract_id));
+        assert_eq!(snapshot_group_state(&env, &contract_id, &client), before);
+    }
+
+    // The rotation picks up exactly where it left off.
+    client.contribute(&member0, &1000);
+    client.contribute(&member2, &1000);
+    assert_eq!(client.get_next_payout_recipient(), member1);
+    client.payout(&member1, &None);
+    assert!(client.has_received_payout(&member1));
+    // 10000 - 1000 * 2 (two cycles) + 3000 (payout) = 11000
+    assert_eq!(token_client.balance(&member1), 11000);
+}
