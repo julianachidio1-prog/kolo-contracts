@@ -96,6 +96,13 @@ The contract checks that the next expected member matches the requested recipien
 
 Because the contract's pool accounting, contribution readiness, and backend payout lifecycle must work together, treat these rules as code under development. Review and test the full lifecycle before deploying a public instance.
 
+## Membership rules
+
+Membership is keyed by Stellar address. Two `Address` values that encode the same account or contract are the same member, so the contract holds at most one active slot in the payout order and one member-state record per address.
+
+- **Duplicate adds are rejected.** Calling `add_member` for an address that is already an active member fails with `Already a member`. The invocation is reverted, so the existing member's position, recorded contributions, and cycle state stay as they were, and no `add_mem` event is emitted. Callers should treat this as a signal that their own membership records are out of sync with the contract.
+- **Re-entry after removal is allowed.** After `remove_member` succeeds, the address can be added again. Removal deletes the previous member-state record (refunding any current-cycle contribution), so a returning member starts with zeroed contribution state and joins at the back of the payout order. Removal itself is still rejected once a member's payout turn has passed.
+
 ## Build and test
 
 Requires Rust and the Wasm target:

@@ -183,6 +183,17 @@ impl KoloSavingsContract {
     }
 
     /// Add a member to the group (Admin only)
+    ///
+    /// Membership is keyed by `Address` value, so each address can hold at most
+    /// one active slot in the rotation and one `MemberState` record. Adding an
+    /// address that is already an active member panics with "Already a member"
+    /// rather than silently succeeding: a second add would otherwise risk
+    /// overwriting the existing `MemberState` (wiping recorded contributions)
+    /// and would hide an out-of-sync caller.
+    ///
+    /// Re-entry is allowed: once `remove_member` has removed an address, it can
+    /// be added again. It rejoins at the back of the payout queue with a fresh,
+    /// zeroed `MemberState`, since removal deletes the previous record.
     pub fn add_member(env: Env, new_member: Address) {
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -190,31 +201,33 @@ impl KoloSavingsContract {
         extend_instance_ttl(&env);
 
         let mut members: Vec<Address> = env.storage().instance().get(&DataKey::Members).unwrap();
-        if !members.contains(&new_member) {
-            members.push_back(new_member.clone());
-            env.storage().instance().set(&DataKey::Members, &members);
-
-            // Initialize MemberState for the new member under a single key
-            let state = MemberState {
-                total_contributions: 0,
-                last_contribution_cycle_id: 0,
-                has_received_payout: false,
-                current_cycle_contribution: 0,
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::Member(new_member.clone()), &state);
-
-            // Initialize NextPayoutIndex if not already set
-            if !env.storage().instance().has(&DataKey::NextPayoutIndex) {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::NextPayoutIndex, &0u32);
-            }
-
-            env.events()
-                .publish((symbol_short!("add_mem"), new_member), ());
+        if members.contains(&new_member) {
+            panic!("Already a member");
         }
+
+        members.push_back(new_member.clone());
+        env.storage().instance().set(&DataKey::Members, &members);
+
+        // Initialize MemberState for the new member under a single key
+        let state = MemberState {
+            total_contributions: 0,
+            last_contribution_cycle_id: 0,
+            has_received_payout: false,
+            current_cycle_contribution: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Member(new_member.clone()), &state);
+
+        // Initialize NextPayoutIndex if not already set
+        if !env.storage().instance().has(&DataKey::NextPayoutIndex) {
+            env.storage()
+                .instance()
+                .set(&DataKey::NextPayoutIndex, &0u32);
+        }
+
+        env.events()
+            .publish((symbol_short!("add_mem"), new_member), ());
     }
 
     /// Remove a member from the group (Admin only)

@@ -95,6 +95,164 @@ fn test_add_member() {
     client.add_member(&member1);
 }
 
+/// Rotational group backed by a real Stellar asset, for the membership
+/// duplicate/re-entry tests below.
+fn setup_membership_group(
+    env: &Env,
+) -> (
+    KoloSavingsContractClient<'_>,
+    Address,
+    token::StellarAssetClient<'_>,
+) {
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, KoloSavingsContract);
+    let client = KoloSavingsContractClient::new(env, &contract_id);
+
+    let admin = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token = env.register_stellar_asset_contract(token_admin);
+    let token_client = token::StellarAssetClient::new(env, &token);
+
+    client.initialize(
+        &admin,
+        &token,
+        &String::from_str(env, "Membership Group"),
+        &1000i128,
+        &GroupType::Rotational,
+        &None,
+        &false,
+        &None,
+    );
+
+    (client, contract_id, token_client)
+}
+
+fn stored_members(env: &Env, contract_id: &Address) -> Vec<Address> {
+    env.as_contract(contract_id, || {
+        env.storage().instance().get(&DataKey::Members).unwrap()
+    })
+}
+
+fn stored_member_state(env: &Env, contract_id: &Address, member: &Address) -> MemberState {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Member(member.clone()))
+            .unwrap()
+    })
+}
+
+#[test]
+#[should_panic(expected = "Already a member")]
+fn test_add_member_twice_panics() {
+    let env = Env::default();
+    let (client, _, _) = setup_membership_group(&env);
+
+    let member = Address::generate(&env);
+    client.add_member(&member);
+    client.add_member(&member);
+}
+
+#[test]
+fn test_duplicate_add_keeps_single_member_record() {
+    let env = Env::default();
+    let (client, contract_id, token_client) = setup_membership_group(&env);
+
+    let member = Address::generate(&env);
+    let other = Address::generate(&env);
+    client.add_member(&member);
+    client.add_member(&other);
+    token_client.mint(&member, &5000);
+    client.contribute(&member, &1000);
+
+    let state_before = stored_member_state(&env, &contract_id, &member);
+
+    assert!(client.try_add_member(&member).is_err());
+
+    // The rejected call must not append a second slot or reset the existing
+    // MemberState (which would wipe the contribution recorded above).
+    assert_eq!(
+        stored_members(&env, &contract_id),
+        vec![&env, member.clone(), other.clone()]
+    );
+    assert_eq!(
+        stored_member_state(&env, &contract_id, &member),
+        state_before
+    );
+    assert_eq!(client.get_contribution(&member), 1000);
+
+    // The member still can't double-contribute: their cycle marker survived.
+    assert!(client.try_contribute(&member, &1000).is_err());
+}
+
+#[test]
+fn test_add_member_duplicate_detected_by_address_value() {
+    let env = Env::default();
+    let (client, contract_id, _) = setup_membership_group(&env);
+
+    let member = Address::generate(&env);
+    client.add_member(&member);
+
+    // An Address rebuilt from the same strkey is a different host object but
+    // the same account, so it must be treated as the same member.
+    let same_member = Address::from_string(&member.to_string());
+    assert_eq!(same_member, member);
+    assert!(client.try_add_member(&same_member).is_err());
+
+    // Distinct addresses are distinct members.
+    let other = Address::generate(&env);
+    assert_ne!(other, member);
+    client.add_member(&other);
+
+    assert_eq!(
+        stored_members(&env, &contract_id),
+        vec![&env, member.clone(), other.clone()]
+    );
+}
+
+#[test]
+fn test_readd_after_removal_is_allowed_with_fresh_state() {
+    let env = Env::default();
+    let (client, contract_id, token_client) = setup_membership_group(&env);
+
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+    let member3 = Address::generate(&env);
+    client.add_member(&member1);
+    client.add_member(&member2);
+    client.add_member(&member3);
+    token_client.mint(&member1, &5000);
+
+    client.contribute(&member1, &1000);
+    client.remove_member(&member1);
+    assert_eq!(token_client.balance(&member1), 5000);
+
+    client.add_member(&member1);
+
+    // Re-entry places the member at the back of the payout queue, once.
+    assert_eq!(
+        stored_members(&env, &contract_id),
+        vec![&env, member2.clone(), member3.clone(), member1.clone()]
+    );
+    assert_eq!(
+        stored_member_state(&env, &contract_id, &member1),
+        MemberState {
+            total_contributions: 0,
+            last_contribution_cycle_id: 0,
+            has_received_payout: false,
+            current_cycle_contribution: 0,
+        }
+    );
+
+    // The refunded contribution can be made again after rejoining.
+    client.contribute(&member1, &1000);
+    assert_eq!(client.get_contribution(&member1), 1000);
+
+    // Re-entry does not open a path to a second active slot.
+    assert!(client.try_add_member(&member1).is_err());
+    assert_eq!(stored_members(&env, &contract_id).len(), 3);
+}
+
 #[test]
 #[should_panic(expected = "Not a member")]
 fn test_contribute_not_member() {
