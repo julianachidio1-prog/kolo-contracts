@@ -94,6 +94,23 @@ configured contribution amount × frozen member count
 
 The contract checks that the next expected member matches the requested recipient and that the contract's token balance covers that payout. It does not itself schedule payouts or initiate a new rotation. After the payout sequence, the application must coordinate the administrator-authorized `reset_cycle()` and `reset_rotation()` calls at the appropriate time.
 
+### Reset call order
+
+Both resets are separate invocations. Each needs its own administrator authorization over empty arguments, so a signature for one cannot be reused for the other.
+
+```text
+contribute (every member) → payout(next) → reset_cycle()        # repeat per member
+... after the last member's payout ...
+reset_cycle() → reset_rotation()                                 # new rotation starts at member 0
+```
+
+| Call | Changes | Leaves untouched | Repeated call |
+| --- | --- | --- | --- |
+| `reset_cycle()` | Increments the cycle ID; clears the frozen member count (rotational groups) | Payout queue position, members, member balances and records, token balance | Opens another cycle each time (not idempotent) |
+| `reset_rotation()` | Sets the payout queue position back to the first member | Cycle ID, frozen member count, members, member records, token balance | No further change (idempotent) |
+
+Both resets are rejected while the contract is paused or while a payout is executing, and a rejected call leaves state unchanged. Blocking `reset_cycle()` during a pause keeps `emergency_withdraw()` working, because that path only refunds contributions recorded against the current cycle ID. The contract does not check that a rotation is complete before `reset_rotation()`; calling it early lets already-paid members be paid again, so the application must enforce the order above.
+
 Because the contract's pool accounting, contribution readiness, and backend payout lifecycle must work together, treat these rules as code under development. Review and test the full lifecycle before deploying a public instance.
 
 ## Build and test

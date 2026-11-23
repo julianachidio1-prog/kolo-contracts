@@ -2,10 +2,12 @@
 #![allow(deprecated)]
 
 use super::*;
+use soroban_sdk::testutils::{AuthorizedFunction, MockAuth, MockAuthInvoke};
 use soroban_sdk::token;
+use soroban_sdk::xdr::{ScErrorCode, ScErrorType};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, testutils::Address as _, testutils::Events,
-    vec, Address, Env, IntoVal, String, Vec,
+    vec, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 #[test]
@@ -1626,4 +1628,470 @@ fn test_emergency_withdraw_twice_panics() {
     client.emergency_withdraw(&member);
     // Second call should panic — no contribution left this cycle.
     client.emergency_withdraw(&member);
+}
+
+// ---------------------------------------------------------------------------
+// Reset authorization tests (reset_cycle / reset_rotation)
+// ---------------------------------------------------------------------------
+//
+// Call order an admin is expected to follow in a rotational group:
+//
+//   1. every member contributes for the cycle
+//   2. payout(next_recipient)
+//   3. reset_cycle()                     -> next cycle, same rotation
+//   ... repeat 1-3 until every member has been paid ...
+//   4. reset_cycle(), then reset_rotation() -> queue restarts at member 0
+//
+// The two resets are separate invocations, each needing its own admin
+// authorization over empty args. Failure paths are driven through the
+// `try_*` client methods so each test can compare the full contract state
+// before and after, proving a rejected reset leaves nothing behind.
+
+struct ResetFixture<'a> {
+    client: KoloSavingsContractClient<'a>,
+    contract_id: Address,
+    admin: Address,
+    token: Address,
+    members: Vec<Address>,
+}
+
+/// Everything a reset could plausibly touch, read straight from storage.
+#[derive(Debug, PartialEq)]
+struct ResetState {
+    admin: Address,
+    current_cycle_id: u32,
+    cycle_member_count: Option<i128>,
+    next_payout_index: Option<u32>,
+    is_paused: bool,
+    is_executing_payout: bool,
+    members: Vec<Address>,
+    member_states: Vec<MemberState>,
+    contract_balance: i128,
+}
+
+/// Rotational group of three members who have all contributed for cycle 1.
+/// Nobody has been paid yet. Leaves `mock_all_auths` enabled.
+fn setup_reset_fixture(env: &Env) -> ResetFixture<'_> {
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, KoloSavingsContract);
+    let client = KoloSavingsContractClient::new(env, &contract_id);
+
+    let admin = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token = env.register_stellar_asset_contract(token_admin);
+    let token_admin_client = token::StellarAssetClient::new(env, &token);
+
+    client.initialize(
+        &admin,
+        &token,
+        &String::from_str(env, "Reset Group"),
+        &1000i128,
+        &GroupType::Rotational,
+        &None,
+        &false,
+        &None,
+    );
+
+    let members = vec![
+        env,
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+    ];
+    // Everyone joins before anyone contributes, otherwise the first
+    // contribution freezes CycleMemberCount below the full group size.
+    for member in members.iter() {
+        client.add_member(&member);
+        token_admin_client.mint(&member, &10_000);
+    }
+    for member in members.iter() {
+        client.contribute(&member, &1000);
+    }
+
+    ResetFixture {
+        client,
+        contract_id,
+        admin,
+        token,
+        members,
+    }
+}
+
+fn contribute_all(fixture: &ResetFixture) {
+    for member in fixture.members.iter() {
+        fixture.client.contribute(&member, &1000);
+    }
+}
+
+fn pay_member(fixture: &ResetFixture, index: u32) {
+    let recipient = fixture.members.get(index).unwrap();
+    fixture.client.payout(&recipient, &None);
+}
+
+/// Note: this makes contract calls of its own, so read `env.auths()` and
+/// `env.events()` for the call under test *before* capturing state.
+fn capture_reset_state(env: &Env, fixture: &ResetFixture) -> ResetState {
+    let contract_balance = token::Client::new(env, &fixture.token).balance(&fixture.contract_id);
+
+    env.as_contract(&fixture.contract_id, || {
+        let instance = env.storage().instance();
+        let mut member_states = Vec::new(env);
+        for member in fixture.members.iter() {
+            let state: MemberState = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Member(member))
+                .unwrap();
+            member_states.push_back(state);
+        }
+
+        ResetState {
+            admin: instance.get(&DataKey::Admin).unwrap(),
+            current_cycle_id: instance.get(&DataKey::CurrentCycleId).unwrap(),
+            cycle_member_count: instance.get(&DataKey::CycleMemberCount),
+            next_payout_index: instance.get(&DataKey::NextPayoutIndex),
+            is_paused: instance.get(&DataKey::IsPaused).unwrap_or(false),
+            is_executing_payout: instance.get(&DataKey::IsExecutingPayout).unwrap_or(false),
+            members: instance.get(&DataKey::Members).unwrap(),
+            member_states,
+            contract_balance,
+        }
+    })
+}
+
+/// Drops any blanket auth mocking and allows exactly one authorization:
+/// `signer` approving `fn_name()` on the savings contract.
+fn authorize_only(env: &Env, contract_id: &Address, signer: &Address, fn_name: &str) {
+    env.mock_auths(&[MockAuth {
+        address: signer,
+        invoke: &MockAuthInvoke {
+            contract: contract_id,
+            fn_name,
+            args: ().into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+}
+
+/// Asserts a `try_*` call aborted inside the contract. A failed `require_auth`
+/// surfaces this way too; the underlying `Error(Auth, InvalidAction)` only
+/// shows up in the panic message, which the `should_panic` tests pin down.
+fn assert_aborted<T: core::fmt::Debug, E: core::fmt::Debug>(
+    result: Result<T, Result<soroban_sdk::Error, E>>,
+) {
+    let aborted =
+        soroban_sdk::Error::from_type_and_code(ScErrorType::Context, ScErrorCode::InvalidAction);
+    match result {
+        Err(Ok(error)) => assert_eq!(error, aborted),
+        other => panic!("expected an aborted invocation, got {:?}", other),
+    }
+}
+
+/// Asserts the last invocation was authorized by the admin alone, for exactly
+/// `fn_name` with no arguments.
+fn assert_admin_authorized(env: &Env, fixture: &ResetFixture, fn_name: &str) {
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    let (signer, invocation) = &auths[0];
+    assert_eq!(signer, &fixture.admin);
+    assert_eq!(
+        invocation.function,
+        AuthorizedFunction::Contract((
+            fixture.contract_id.clone(),
+            Symbol::new(env, fn_name),
+            ().into_val(env),
+        ))
+    );
+    assert!(invocation.sub_invocations.is_empty());
+}
+
+fn assert_no_events(env: &Env) {
+    let no_events: Vec<(Address, Vec<Val>, Val)> = Vec::new(env);
+    assert_eq!(env.events().all(), no_events);
+}
+
+fn assert_single_event(env: &Env, contract_id: &Address, topic: Symbol) {
+    assert_eq!(
+        env.events().all(),
+        vec![
+            env,
+            (
+                contract_id.clone(),
+                vec![env, topic.into_val(env)],
+                ().into_val(env)
+            )
+        ]
+    );
+}
+
+#[test]
+fn test_reset_cycle_by_non_admin_is_rejected_without_state_change() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    pay_member(&fixture, 0);
+    let before = capture_reset_state(&env, &fixture);
+
+    let attacker = Address::generate(&env);
+    authorize_only(&env, &fixture.contract_id, &attacker, "reset_cycle");
+
+    assert_aborted(fixture.client.try_reset_cycle());
+    assert_no_events(&env);
+    assert_eq!(capture_reset_state(&env, &fixture), before);
+}
+
+#[test]
+fn test_reset_rotation_by_non_admin_is_rejected_without_state_change() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    // Move the queue off zero so an unauthorized rewind would be observable.
+    pay_member(&fixture, 0);
+    let before = capture_reset_state(&env, &fixture);
+    assert_eq!(before.next_payout_index, Some(1));
+
+    let attacker = Address::generate(&env);
+    authorize_only(&env, &fixture.contract_id, &attacker, "reset_rotation");
+
+    assert_aborted(fixture.client.try_reset_rotation());
+    assert_no_events(&env);
+    assert_eq!(capture_reset_state(&env, &fixture), before);
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_reset_cycle_by_non_admin_panics() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+
+    let attacker = Address::generate(&env);
+    authorize_only(&env, &fixture.contract_id, &attacker, "reset_cycle");
+    fixture.client.reset_cycle();
+}
+
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_reset_rotation_by_non_admin_panics() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+
+    let attacker = Address::generate(&env);
+    authorize_only(&env, &fixture.contract_id, &attacker, "reset_rotation");
+    fixture.client.reset_rotation();
+}
+
+#[test]
+fn test_resets_without_any_authorization_are_rejected() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    pay_member(&fixture, 0);
+    let before = capture_reset_state(&env, &fixture);
+
+    env.mock_auths(&[]);
+
+    assert_aborted(fixture.client.try_reset_cycle());
+    assert_aborted(fixture.client.try_reset_rotation());
+    assert_eq!(capture_reset_state(&env, &fixture), before);
+}
+
+#[test]
+fn test_admin_auth_for_one_reset_cannot_be_replayed_on_the_other() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    pay_member(&fixture, 0);
+    let before = capture_reset_state(&env, &fixture);
+
+    // Both resets take empty args, so the function name is the only thing
+    // distinguishing the two signatures. Each must still be rejected.
+    authorize_only(&env, &fixture.contract_id, &fixture.admin, "reset_rotation");
+    assert_aborted(fixture.client.try_reset_cycle());
+
+    authorize_only(&env, &fixture.contract_id, &fixture.admin, "reset_cycle");
+    assert_aborted(fixture.client.try_reset_rotation());
+
+    assert_eq!(capture_reset_state(&env, &fixture), before);
+}
+
+#[test]
+fn test_reset_cycle_by_admin_changes_only_cycle_fields() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    pay_member(&fixture, 0);
+    let before = capture_reset_state(&env, &fixture);
+    assert_eq!(before.current_cycle_id, 1);
+    assert_eq!(before.cycle_member_count, Some(3));
+    assert_eq!(before.next_payout_index, Some(1));
+
+    authorize_only(&env, &fixture.contract_id, &fixture.admin, "reset_cycle");
+    fixture.client.reset_cycle();
+
+    assert_admin_authorized(&env, &fixture, "reset_cycle");
+    assert_single_event(&env, &fixture.contract_id, symbol_short!("reset"));
+
+    // The payout queue, membership, member ledgers and funds are untouched.
+    let mut expected = before;
+    expected.current_cycle_id = 2;
+    expected.cycle_member_count = None;
+    assert_eq!(capture_reset_state(&env, &fixture), expected);
+}
+
+#[test]
+fn test_reset_rotation_by_admin_changes_only_payout_index() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    let first = fixture.members.get(0).unwrap();
+    fixture.client.payout(&first, &None);
+    let before = capture_reset_state(&env, &fixture);
+    assert!(before.member_states.get(0).unwrap().has_received_payout);
+
+    authorize_only(&env, &fixture.contract_id, &fixture.admin, "reset_rotation");
+    fixture.client.reset_rotation();
+
+    assert_admin_authorized(&env, &fixture, "reset_rotation");
+    assert_single_event(&env, &fixture.contract_id, symbol_short!("new_rot"));
+
+    // Cycle bookkeeping is left alone, and the stored has_received_payout
+    // flag stays as a historical record. The public getter is derived from
+    // NextPayoutIndex, so it is the one that reports "not yet paid".
+    let mut expected = before;
+    expected.next_payout_index = Some(0);
+    assert_eq!(capture_reset_state(&env, &fixture), expected);
+
+    assert!(!fixture.client.has_received_payout(&first));
+    assert_eq!(fixture.client.get_next_payout_recipient(), first);
+}
+
+#[test]
+fn test_resets_rejected_while_paused_keep_emergency_withdraw_available() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    fixture.client.pause();
+    let before = capture_reset_state(&env, &fixture);
+    assert!(before.is_paused);
+
+    // Auth is fully mocked, so these fail on the pause check alone.
+    assert_aborted(fixture.client.try_reset_cycle());
+    assert_aborted(fixture.client.try_reset_rotation());
+    assert_eq!(capture_reset_state(&env, &fixture), before);
+
+    // Because the cycle ID did not move, members can still pull out what
+    // they paid in this cycle.
+    let member = fixture.members.get(0).unwrap();
+    let token_client = token::Client::new(&env, &fixture.token);
+    fixture.client.emergency_withdraw(&member);
+    assert_eq!(token_client.balance(&member), 10_000);
+
+    // Once unpaused, the admin can reset as normal.
+    fixture.client.unpause();
+    fixture.client.reset_cycle();
+    assert_eq!(capture_reset_state(&env, &fixture).current_cycle_id, 2);
+}
+
+#[test]
+#[should_panic(expected = "Contract is paused for emergency")]
+fn test_reset_cycle_while_paused_panics() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    fixture.client.pause();
+    fixture.client.reset_cycle();
+}
+
+#[test]
+#[should_panic(expected = "Contract is paused for emergency")]
+fn test_reset_rotation_while_paused_panics() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    fixture.client.pause();
+    fixture.client.reset_rotation();
+}
+
+#[test]
+fn test_resets_rejected_while_payout_executing_leave_state_intact() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    env.as_contract(&fixture.contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::IsExecutingPayout, &true);
+    });
+    let before = capture_reset_state(&env, &fixture);
+
+    assert_aborted(fixture.client.try_reset_cycle());
+    assert_aborted(fixture.client.try_reset_rotation());
+    assert_eq!(capture_reset_state(&env, &fixture), before);
+}
+
+#[test]
+fn test_repeated_reset_cycle_opens_a_new_cycle_each_time() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    pay_member(&fixture, 0);
+    let before = capture_reset_state(&env, &fixture);
+
+    fixture.client.reset_cycle();
+    fixture.client.reset_cycle();
+    assert_single_event(&env, &fixture.contract_id, symbol_short!("reset"));
+
+    // Not idempotent: the second call skips straight past cycle 2. Nothing
+    // else drifts, and clearing an already-cleared member count is harmless.
+    let mut expected = before;
+    expected.current_cycle_id = 3;
+    expected.cycle_member_count = None;
+    assert_eq!(capture_reset_state(&env, &fixture), expected);
+
+    // Members get exactly one contribution in the new cycle.
+    let member = fixture.members.get(1).unwrap();
+    fixture.client.contribute(&member, &1000);
+    assert_aborted(fixture.client.try_contribute(&member, &1000));
+}
+
+#[test]
+fn test_repeated_reset_rotation_is_idempotent() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+    pay_member(&fixture, 0);
+
+    fixture.client.reset_rotation();
+    let after_first = capture_reset_state(&env, &fixture);
+    assert_eq!(after_first.next_payout_index, Some(0));
+
+    fixture.client.reset_rotation();
+    assert_single_event(&env, &fixture.contract_id, symbol_short!("new_rot"));
+    assert_eq!(capture_reset_state(&env, &fixture), after_first);
+}
+
+#[test]
+fn test_end_of_rotation_resets_are_independent_invocations() {
+    let env = Env::default();
+    let fixture = setup_reset_fixture(&env);
+
+    // Run the whole rotation using the documented call order.
+    pay_member(&fixture, 0);
+    fixture.client.reset_cycle();
+    contribute_all(&fixture);
+    pay_member(&fixture, 1);
+    fixture.client.reset_cycle();
+    contribute_all(&fixture);
+    pay_member(&fixture, 2);
+
+    // The admin signs only the cycle reset. It lands; the rotation reset
+    // that follows is rejected on its own and must not disturb it.
+    authorize_only(&env, &fixture.contract_id, &fixture.admin, "reset_cycle");
+    fixture.client.reset_cycle();
+    let after_cycle_reset = capture_reset_state(&env, &fixture);
+    assert_eq!(after_cycle_reset.current_cycle_id, 4);
+    assert_eq!(after_cycle_reset.cycle_member_count, None);
+    assert_eq!(after_cycle_reset.next_payout_index, Some(3));
+
+    assert_aborted(fixture.client.try_reset_rotation());
+    assert_eq!(capture_reset_state(&env, &fixture), after_cycle_reset);
+
+    // With the admin's signature the rotation restarts at member 0.
+    authorize_only(&env, &fixture.contract_id, &fixture.admin, "reset_rotation");
+    fixture.client.reset_rotation();
+    let mut expected = after_cycle_reset;
+    expected.next_payout_index = Some(0);
+    assert_eq!(capture_reset_state(&env, &fixture), expected);
+    assert_eq!(
+        fixture.client.get_next_payout_recipient(),
+        fixture.members.get(0).unwrap()
+    );
 }

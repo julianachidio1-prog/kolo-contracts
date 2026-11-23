@@ -702,7 +702,8 @@ impl KoloSavingsContract {
             .publish((symbol_short!("emg_wd"), member), amount);
     }
 
-    /// Pause the contract (Admin only). Blocks contribute, payout, add_member, reset_cycle.
+    /// Pause the contract (Admin only). Blocks contribute, payout, add_member,
+    /// reset_cycle, reset_rotation.
     pub fn pause(env: Env) {
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -724,9 +725,18 @@ impl KoloSavingsContract {
     /// Resets the payout cycle so members can contribute and receive payouts again.
     /// NextPayoutIndex persists across the full rotation — it only resets when
     /// all members have received their payout and the admin triggers a new rotation.
+    ///
+    /// Only `CurrentCycleId` (incremented) and, for rotational groups,
+    /// `CycleMemberCount` (cleared) change. Each call opens a new cycle, so calling
+    /// it twice skips a cycle. Call it after the cycle's payout; at the end of a
+    /// rotation, call it before `reset_rotation`.
+    ///
+    /// Rejected while paused: emergency_withdraw only refunds contributions tagged
+    /// with the current cycle ID, so advancing it mid-emergency would strand them.
     pub fn reset_cycle(env: Env) {
         assert_not_executing_payout(&env);
 
+        require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth_for_args(().into_val(&env));
         extend_instance_ttl(&env);
@@ -757,9 +767,15 @@ impl KoloSavingsContract {
 
     /// Resets the payout queue so the rotation starts from the first member again.
     /// Call this after all members have received their payout to begin a new rotation.
+    ///
+    /// Only `NextPayoutIndex` changes (set to 0), so repeated calls are idempotent.
+    /// The contract does not check that the rotation is complete; calling this
+    /// early lets members who were already paid be paid again. Like `reset_cycle`,
+    /// it is rejected while paused so the payout queue stays frozen.
     pub fn reset_rotation(env: Env) {
         assert_not_executing_payout(&env);
 
+        require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth_for_args(().into_val(&env));
         extend_instance_ttl(&env);
