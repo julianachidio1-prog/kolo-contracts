@@ -84,6 +84,8 @@ has_received_payout(member: Address) -> bool
 
 `GroupType` is `Rotational` or `GoalBased`. Initialization starts with no members; the administrator must add them. State-changing operations require the corresponding Soroban authorization. A successful contract invocation is still only one part of a complete product flow: the application must submit it to the intended network, wait for confirmation, and reconcile the resulting state.
 
+`initialize` succeeds only once per contract instance. Any later call fails with `Already initialized`, even when it repeats the original arguments, changes any of them, or carries valid authorization for a different admin. This check runs before authorization and argument validation, so an invalid second call also fails with `Already initialized`. A rejected call writes nothing: the admin, token, name, contribution amount, group type, target amount, lock flag, cycle length, and member list all stay as they were. The contract has no upgrade or reconfiguration method, so a group with different settings needs a new contract instance.
+
 ## Rotational cycle notes
 
 The first contribution in a cycle freezes the current member count. Each member can contribute once in that cycle. The administrator then calls `payout(expected_recipient)` in the contract's deterministic member order. The contract computes the payout as:

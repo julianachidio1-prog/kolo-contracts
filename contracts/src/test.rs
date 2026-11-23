@@ -67,6 +67,294 @@ fn test_double_initialize() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Duplicate-initialization tests
+// ---------------------------------------------------------------------------
+//
+// `initialize` must only ever succeed once. Each test below initializes a
+// group, then attempts a second initialization that changes one parameter
+// (or all of them) and checks that the attempt is rejected and that every
+// piece of stored configuration is byte-for-byte what the first call wrote.
+
+/// Arguments to `initialize`, bundled so a test can tweak a single field.
+#[derive(Clone)]
+struct InitArgs {
+    admin: Address,
+    token: Address,
+    name: String,
+    contribution_amount: i128,
+    group_type: GroupType,
+    target_amount: Option<i128>,
+    lock_until_target: bool,
+    expected_cycle_days: Option<u32>,
+}
+
+impl InitArgs {
+    fn original(env: &Env) -> Self {
+        Self {
+            admin: Address::generate(env),
+            token: Address::generate(env),
+            name: String::from_str(env, "Original Group"),
+            contribution_amount: 1000,
+            group_type: GroupType::Rotational,
+            target_amount: None,
+            lock_until_target: false,
+            expected_cycle_days: None,
+        }
+    }
+
+    fn try_apply(
+        &self,
+        client: &KoloSavingsContractClient<'_>,
+    ) -> Result<
+        Result<(), soroban_sdk::ConversionError>,
+        Result<soroban_sdk::Error, soroban_sdk::InvokeError>,
+    > {
+        client.try_initialize(
+            &self.admin,
+            &self.token,
+            &self.name,
+            &self.contribution_amount,
+            &self.group_type,
+            &self.target_amount,
+            &self.lock_until_target,
+            &self.expected_cycle_days,
+        )
+    }
+}
+
+/// Everything `initialize` writes, plus the member list so we can tell that a
+/// rejected re-initialization didn't wipe an already-running group.
+#[derive(Debug, PartialEq)]
+struct StoredGroupConfig {
+    admin: Address,
+    token: Address,
+    name: String,
+    contribution_amount: i128,
+    group_type: GroupType,
+    target_amount: Option<i128>,
+    lock_until_target: bool,
+    cycle_length_ledgers: u32,
+    current_cycle_id: u32,
+    members: Vec<Address>,
+}
+
+fn read_group_config(env: &Env, contract_id: &Address) -> StoredGroupConfig {
+    env.as_contract(contract_id, || {
+        let storage = env.storage().instance();
+        StoredGroupConfig {
+            admin: storage.get(&DataKey::Admin).unwrap(),
+            token: storage.get(&DataKey::Token).unwrap(),
+            name: storage.get(&DataKey::Name).unwrap(),
+            contribution_amount: storage.get(&DataKey::ContributionAmount).unwrap(),
+            group_type: storage.get(&DataKey::GroupType).unwrap(),
+            target_amount: storage.get(&DataKey::TargetAmount),
+            lock_until_target: storage.get(&DataKey::LockUntilTarget).unwrap(),
+            cycle_length_ledgers: storage.get(&DataKey::CycleLengthLedgers).unwrap(),
+            current_cycle_id: storage.get(&DataKey::CurrentCycleId).unwrap(),
+            members: storage.get(&DataKey::Members).unwrap(),
+        }
+    })
+}
+
+/// Initializes a group with `InitArgs::original`, enrolls a member, then runs
+/// a second `initialize` with the arguments produced by `change` and asserts
+/// it fails without touching stored state.
+fn assert_reinitialization_rejected(change: impl FnOnce(&Env, &mut InitArgs)) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, KoloSavingsContract);
+    let client = KoloSavingsContractClient::new(&env, &contract_id);
+
+    let original = InitArgs::original(&env);
+    assert_eq!(original.try_apply(&client), Ok(Ok(())));
+
+    let member = Address::generate(&env);
+    client.add_member(&member);
+
+    let before = read_group_config(&env, &contract_id);
+
+    let mut replacement = original.clone();
+    change(&env, &mut replacement);
+
+    // mock_all_auths is still active, so the replacement admin's signature is
+    // "present" — the call must fail on the initialization guard alone.
+    assert!(
+        replacement.try_apply(&client).is_err(),
+        "second initialize must be rejected"
+    );
+
+    let after = read_group_config(&env, &contract_id);
+    assert_eq!(after, before);
+    assert_eq!(after.admin, original.admin);
+    assert_eq!(after.token, original.token);
+    assert_eq!(after.members, vec![&env, member]);
+}
+
+#[test]
+fn test_reinitialize_with_same_arguments_is_rejected() {
+    assert_reinitialization_rejected(|_, _| {});
+}
+
+#[test]
+fn test_reinitialize_with_different_admin_is_rejected() {
+    assert_reinitialization_rejected(|env, args| args.admin = Address::generate(env));
+}
+
+#[test]
+fn test_reinitialize_with_different_token_is_rejected() {
+    assert_reinitialization_rejected(|env, args| args.token = Address::generate(env));
+}
+
+#[test]
+fn test_reinitialize_with_different_name_is_rejected() {
+    assert_reinitialization_rejected(|env, args| {
+        args.name = String::from_str(env, "Hijacked Group");
+    });
+}
+
+#[test]
+fn test_reinitialize_with_different_contribution_amount_is_rejected() {
+    assert_reinitialization_rejected(|_, args| args.contribution_amount = 5000);
+}
+
+#[test]
+fn test_reinitialize_with_different_group_type_is_rejected() {
+    assert_reinitialization_rejected(|_, args| args.group_type = GroupType::GoalBased);
+}
+
+#[test]
+fn test_reinitialize_with_different_target_amount_is_rejected() {
+    assert_reinitialization_rejected(|_, args| args.target_amount = Some(50_000));
+}
+
+#[test]
+fn test_reinitialize_with_different_lock_until_target_is_rejected() {
+    assert_reinitialization_rejected(|_, args| args.lock_until_target = true);
+}
+
+#[test]
+fn test_reinitialize_with_different_cycle_days_is_rejected() {
+    assert_reinitialization_rejected(|_, args| args.expected_cycle_days = Some(7));
+}
+
+#[test]
+fn test_reinitialize_with_every_argument_changed_is_rejected() {
+    assert_reinitialization_rejected(|env, args| {
+        *args = InitArgs {
+            admin: Address::generate(env),
+            token: Address::generate(env),
+            name: String::from_str(env, "Hijacked Group"),
+            contribution_amount: 5000,
+            group_type: GroupType::GoalBased,
+            target_amount: Some(50_000),
+            lock_until_target: true,
+            expected_cycle_days: Some(7),
+        };
+    });
+}
+
+/// The guard runs before argument validation, so callers get the same
+/// "Already initialized" error even when the new arguments are themselves
+/// invalid — the existing group is never re-validated or re-written.
+#[test]
+#[should_panic(expected = "Already initialized")]
+fn test_reinitialize_with_invalid_amount_reports_already_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, KoloSavingsContract);
+    let client = KoloSavingsContractClient::new(&env, &contract_id);
+
+    let original = InitArgs::original(&env);
+    assert_eq!(original.try_apply(&client), Ok(Ok(())));
+
+    client.initialize(
+        &original.admin,
+        &original.token,
+        &original.name,
+        &0i128,
+        &original.group_type,
+        &original.target_amount,
+        &original.lock_until_target,
+        &original.expected_cycle_days,
+    );
+}
+
+/// A third party with no authorization at all is turned away by the
+/// initialization guard itself, before any auth check is reached.
+#[test]
+#[should_panic(expected = "Already initialized")]
+fn test_reinitialize_without_auth_reports_already_initialized() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, KoloSavingsContract);
+    let client = KoloSavingsContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    let original = InitArgs::original(&env);
+    assert_eq!(original.try_apply(&client), Ok(Ok(())));
+
+    // Drop every mocked authorization so the attacker's call carries none.
+    env.set_auths(&[]);
+    let attacker = Address::generate(&env);
+    client.initialize(
+        &attacker,
+        &Address::generate(&env),
+        &String::from_str(&env, "Hijacked Group"),
+        &original.contribution_amount,
+        &original.group_type,
+        &original.target_amount,
+        &original.lock_until_target,
+        &original.expected_cycle_days,
+    );
+}
+
+/// After a rejected takeover attempt the original admin keeps full control
+/// and the would-be replacement admin has none.
+#[test]
+fn test_original_admin_retains_control_after_rejected_reinitialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, KoloSavingsContract);
+    let client = KoloSavingsContractClient::new(&env, &contract_id);
+
+    let original = InitArgs::original(&env);
+    assert_eq!(original.try_apply(&client), Ok(Ok(())));
+
+    let mut takeover = original.clone();
+    takeover.admin = Address::generate(&env);
+    assert!(takeover.try_apply(&client).is_err());
+
+    let member = Address::generate(&env);
+
+    // Only the would-be admin signs: add_member must be refused.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &takeover.admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "add_member",
+            args: (member.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_add_member(&member).is_err());
+
+    // The original admin's signature is still the one that counts.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &original.admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "add_member",
+            args: (member.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.add_member(&member);
+
+    let config = read_group_config(&env, &contract_id);
+    assert_eq!(config.admin, original.admin);
+    assert_eq!(config.members, vec![&env, member]);
+}
+
 #[test]
 fn test_add_member() {
     let env = Env::default();

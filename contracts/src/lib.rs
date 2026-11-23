@@ -65,7 +65,7 @@ fn require_not_paused(env: &Env) {
 }
 
 #[contracttype]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GroupType {
     Rotational,
     GoalBased,
@@ -113,7 +113,17 @@ pub struct KoloSavingsContract;
 
 #[contractimpl]
 impl KoloSavingsContract {
-    /// Initialize the savings group
+    /// Initialize the savings group.
+    ///
+    /// Initialization is strictly one-time per contract instance. Once an
+    /// admin has been stored, every later call panics with
+    /// `"Already initialized"` — whether the arguments match the original
+    /// ones or not, and even if the caller holds valid authorization for the
+    /// new admin. The guard runs before authorization and argument
+    /// validation, so a rejected call never writes storage: the original
+    /// admin, token, name, contribution amount, group type, target, lock flag,
+    /// cycle length, and member list all stay exactly as they were. There is
+    /// intentionally no upgrade or reconfiguration path.
     #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
